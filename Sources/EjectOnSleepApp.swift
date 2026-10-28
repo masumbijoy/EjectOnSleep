@@ -18,7 +18,7 @@ struct EjectOnSleepApp: App {
     }()
 
     var body: some Scene {
-        MenuBarExtra(isInserted: Binding(get: { !model.hideIcon }, set: { model.hideIcon = !$0 })) {
+        MenuBarExtra(isInserted: Binding(get: { !model.hideIcon }, set: { if model.hideIcon == $0 { model.hideIcon = !$0 } })) {
             Toggle("Eject drives when Mac sleeps", isOn: $model.enabled)
             Toggle("Launch at login", isOn: $model.launchAtLogin)
             Divider()
