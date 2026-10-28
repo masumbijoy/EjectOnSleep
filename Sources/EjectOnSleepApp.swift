@@ -6,7 +6,8 @@ import ServiceManagement
 
 @main
 struct EjectOnSleepApp: App {
-    @StateObject private var model = EjectModel()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @ObservedObject private var model = EjectModel.shared
 
     private static let menuBarIcon: NSImage = {
         let config = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
@@ -17,7 +18,7 @@ struct EjectOnSleepApp: App {
     }()
 
     var body: some Scene {
-        MenuBarExtra {
+        MenuBarExtra(isInserted: Binding(get: { !model.hideIcon }, set: { model.hideIcon = !$0 })) {
             Toggle("Eject drives when Mac sleeps", isOn: $model.enabled)
             Toggle("Launch at login", isOn: $model.launchAtLogin)
             Divider()
@@ -26,6 +27,7 @@ struct EjectOnSleepApp: App {
                 Text(model.lastMessage)
             }
             Divider()
+            Button("Settings…") { AppDelegate.showSettings() }
             Button("Quit") { NSApplication.shared.terminate(nil) }
         } label: {
             Image(nsImage: Self.menuBarIcon)
@@ -33,7 +35,74 @@ struct EjectOnSleepApp: App {
     }
 }
 
+// Opens the settings window when the app is launched by hand or reopened (e.g. from
+// Applications), so settings stay reachable while the menu bar icon is hidden.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private static var window: NSWindow?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let launchedAtLogin = NSAppleEventManager.shared().currentAppleEvent?
+            .paramDescriptor(forKeyword: AEKeyword(keyAEPropData))?
+            .enumCodeValue == OSType(keyAELaunchedAsLogInItem)
+        if EjectModel.shared.hideIcon && !launchedAtLogin {
+            Self.showSettings()
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        Self.showSettings()
+        return true
+    }
+
+    static func showSettings() {
+        if window == nil {
+            let w = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 380, height: 300),
+                styleMask: [.titled, .closable],
+                backing: .buffered,
+                defer: false
+            )
+            w.title = "Eject on Sleep"
+            w.isReleasedWhenClosed = false
+            w.contentView = NSHostingView(rootView: SettingsView(model: EjectModel.shared))
+            w.center()
+            window = w
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+}
+
+struct SettingsView: View {
+    @ObservedObject var model: EjectModel
+
+    var body: some View {
+        Form {
+            Toggle("Eject drives when Mac sleeps", isOn: $model.enabled)
+            Toggle("Launch at login", isOn: $model.launchAtLogin)
+            Toggle("Hide menu bar icon", isOn: $model.hideIcon)
+            Text("With the icon hidden, open Eject on Sleep from Applications to bring this window back.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Divider()
+            HStack {
+                Button("Eject all external drives now") { model.ejectNow() }
+                if !model.lastMessage.isEmpty {
+                    Text(model.lastMessage).font(.caption).foregroundColor(.secondary)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 380)
+    }
+}
+
 final class EjectModel: ObservableObject {
+    static let shared = EjectModel()
+
+    @Published var hideIcon: Bool {
+        didSet { UserDefaults.standard.set(hideIcon, forKey: "hideIcon") }
+    }
     @Published var enabled: Bool {
         didSet { UserDefaults.standard.set(enabled, forKey: "enabled") }
     }
@@ -42,7 +111,8 @@ final class EjectModel: ObservableObject {
     }
     @Published var lastMessage: String = ""
 
-    init() {
+    private init() {
+        hideIcon = UserDefaults.standard.bool(forKey: "hideIcon")
         enabled = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true
         launchAtLogin = SMAppService.mainApp.status == .enabled
 
