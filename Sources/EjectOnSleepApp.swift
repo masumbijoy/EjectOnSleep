@@ -20,6 +20,7 @@ struct EjectOnSleepApp: App {
     var body: some Scene {
         MenuBarExtra(isInserted: Binding(get: { !model.hideIcon }, set: { if model.hideIcon == $0 { model.hideIcon = !$0 } })) {
             Toggle("Eject drives when Mac sleeps", isOn: $model.enabled)
+            Toggle("Remount drives on wake", isOn: $model.remountOnWake)
             Toggle("Launch at login", isOn: $model.launchAtLogin)
             Divider()
             Button("Eject all external drives now") { model.ejectNow() }
@@ -79,6 +80,8 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Toggle("Eject drives when Mac sleeps", isOn: $model.enabled)
+            Toggle("Remount drives on wake", isOn: $model.remountOnWake)
+            Toggle("Unmount instead of fully ejecting (keeps drive powered)", isOn: $model.unmountOnly)
             Toggle("Launch at login", isOn: $model.launchAtLogin)
             Toggle("Hide menu bar icon", isOn: $model.hideIcon)
             Text("With the icon hidden, open Eject on Sleep from Applications to bring this window back.")
@@ -109,11 +112,22 @@ final class EjectModel: ObservableObject {
     @Published var launchAtLogin: Bool {
         didSet { updateLoginItem() }
     }
+    // Unmount keeps the drive powered and attached (safer with docks); full eject can power it off.
+    @Published var unmountOnly: Bool {
+        didSet { UserDefaults.standard.set(unmountOnly, forKey: "unmountOnly") }
+    }
+    @Published var remountOnWake: Bool {
+        didSet { UserDefaults.standard.set(remountOnWake, forKey: "remountOnWake") }
+    }
     @Published var lastMessage: String = ""
+
+    private var disksToRemount: [String] = []
 
     private init() {
         hideIcon = UserDefaults.standard.bool(forKey: "hideIcon")
         enabled = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true
+        unmountOnly = UserDefaults.standard.object(forKey: "unmountOnly") as? Bool ?? true
+        remountOnWake = UserDefaults.standard.object(forKey: "remountOnWake") as? Bool ?? true
         launchAtLogin = SMAppService.mainApp.status == .enabled
 
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -122,7 +136,35 @@ final class EjectModel: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             guard let self = self, self.enabled else { return }
+            self.disksToRemount = Self.externalDisks()
             self.ejectNow()
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.remountAfterWake()
+        }
+    }
+
+    // Drives often reappear a few seconds after wake (docks/hubs), so retry a few times.
+    private func remountAfterWake() {
+        guard enabled, remountOnWake, !disksToRemount.isEmpty else { return }
+        let disks = disksToRemount
+        disksToRemount = []
+        DispatchQueue.global().async {
+            var pending = disks
+            for _ in 0..<6 {
+                Thread.sleep(forTimeInterval: 5)
+                pending = pending.filter { !Self.run(["mountDisk", $0]) }
+                if pending.isEmpty { break }
+            }
+            DispatchQueue.main.async {
+                self.lastMessage = pending.isEmpty
+                    ? "Remounted \(disks.count) drive(s)"
+                    : "Could not remount \(pending.count) of \(disks.count) drive(s)"
+            }
         }
     }
 
@@ -134,9 +176,9 @@ final class EjectModel: ObservableObject {
         }
         var ok = 0
         for disk in disks {
-            if Self.run(["eject", disk]) { ok += 1 }
+            if Self.run([unmountOnly ? "unmountDisk" : "eject", disk]) { ok += 1 }
         }
-        lastMessage = "Ejected \(ok) of \(disks.count) drive(s)"
+        lastMessage = "\(unmountOnly ? "Unmounted" : "Ejected") \(ok) of \(disks.count) drive(s)"
     }
 
     private static func externalDisks() -> [String] {
