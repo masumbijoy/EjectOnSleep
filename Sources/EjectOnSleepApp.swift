@@ -24,6 +24,7 @@ struct EjectOnSleepApp: App {
             Toggle("Launch at login", isOn: $model.launchAtLogin)
             Divider()
             Button("Eject all external drives now") { model.ejectNow() }
+            Button("Unmount drives and sleep") { model.unmountAndSleep() }
             if !model.lastMessage.isEmpty {
                 Text(model.lastMessage)
             }
@@ -90,6 +91,7 @@ struct SettingsView: View {
             Divider()
             HStack {
                 Button("Eject all external drives now") { model.ejectNow() }
+                Button("Unmount and sleep") { model.unmountAndSleep() }
                 if !model.lastMessage.isEmpty {
                     Text(model.lastMessage).font(.caption).foregroundColor(.secondary)
                 }
@@ -122,6 +124,7 @@ final class EjectModel: ObservableObject {
     @Published var lastMessage: String = ""
 
     private var disksToRemount: [String] = []
+    private var sleepProblems: [String] = []
 
     private init() {
         hideIcon = UserDefaults.standard.bool(forKey: "hideIcon")
@@ -137,14 +140,29 @@ final class EjectModel: ObservableObject {
         ) { [weak self] _ in
             guard let self = self, self.enabled else { return }
             self.disksToRemount = Self.externalDisks()
-            self.ejectNow()
+            self.sleepProblems = self.ejectNow()
         }
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
+            self?.warnAboutSleepProblems()
             self?.remountAfterWake()
+        }
+    }
+
+    // A sleep that was already underway can't be stopped, so report what was still in use once awake.
+    private func warnAboutSleepProblems() {
+        guard !sleepProblems.isEmpty else { return }
+        let problems = sleepProblems
+        sleepProblems = []
+        DispatchQueue.main.async {
+            _ = Self.confirm(
+                title: "Some drives could not be unmounted before sleep",
+                message: problems.joined(separator: "\n\n") + "\n\nCheck the drive for problems and close the files or apps using it before the next sleep.",
+                yes: "OK", no: "Dismiss"
+            )
         }
     }
 
@@ -168,17 +186,60 @@ final class EjectModel: ObservableObject {
         }
     }
 
-    func ejectNow() {
+    @discardableResult
+    func ejectNow() -> [String] {
         let disks = Self.externalDisks()
         if disks.isEmpty {
             lastMessage = "No external drives found"
-            return
+            return []
         }
         var ok = 0
+        var problems: [String] = []
         for disk in disks {
-            if Self.run([unmountOnly ? "unmountDisk" : "eject", disk]) { ok += 1 }
+            let result = Self.runOutput([unmountOnly ? "unmountDisk" : "eject", disk])
+            if result.ok {
+                ok += 1
+            } else {
+                problems.append(Self.describeFailure(disk: disk, output: result.output))
+            }
         }
         lastMessage = "\(unmountOnly ? "Unmounted" : "Ejected") \(ok) of \(disks.count) drive(s)"
+        return problems
+    }
+
+    // Unmounts first; if anything is still in use, warns before the Mac actually sleeps.
+    func unmountAndSleep() {
+        let problems = ejectNow()
+        if !problems.isEmpty && !Self.confirm(
+            title: "Some drives are still in use",
+            message: problems.joined(separator: "\n\n") + "\n\nSleeping now may disconnect them while files are open.",
+            yes: "Sleep Anyway", no: "Cancel"
+        ) {
+            return
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        p.arguments = ["sleepnow"]
+        try? p.run()
+    }
+
+    private static func describeFailure(disk: String, output: String) -> String {
+        let lines = output.split(separator: "\n").map(String.init)
+        let reason = lines.first(where: { $0.contains("dissented") })
+            .map { $0.replacingOccurrences(of: "Unmount was dissented by", with: "In use by") }
+            ?? lines.last ?? "It is in use."
+        return "\(disk): \(reason)"
+    }
+
+    static func confirm(title: String, message: String, yes: String, no: String) -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: yes)
+        alert.addButton(withTitle: no)
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     private static func externalDisks() -> [String] {
@@ -201,6 +262,24 @@ final class EjectModel: ObservableObject {
             return p.terminationStatus == 0
         } catch {
             return false
+        }
+    }
+
+    private static func runOutput(_ args: [String]) -> (ok: Bool, output: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do {
+            try p.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return (p.terminationStatus == 0, text)
+        } catch {
+            return (false, error.localizedDescription)
         }
     }
 
